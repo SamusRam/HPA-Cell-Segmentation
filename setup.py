@@ -1,6 +1,8 @@
 """Set up file for HPA-Cell-Segmentation package."""
 from pathlib import Path
 from setuptools import find_packages, setup
+from Cython.Build import cythonize
+import numpy as np
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 README_FILE = PROJECT_DIR / "README.org"
@@ -14,6 +16,9 @@ try:
 except FileNotFoundError:
     print("WARNING: missing requirements.txt.")
 
+import Cython.Compiler.Options
+Cython.Compiler.Options.annotate = True
+
 setup(
     name="hpacellseg",
     version=VERSION,
@@ -26,8 +31,10 @@ setup(
     packages=find_packages(exclude=["contrib", "docs", "tests*"]),
     python_requires=">=3.6",
     dependency_links=[],
-    install_requires=requirements,
+    # install_requires=requirements,
     include_package_data=True,
+    ext_modules=cythonize("hpacellseg/utils_cython.pyx", annotate=True),
+    include_dirs=np.get_include(),
     zip_safe=False,
     classifiers=[
         "Development Status :: 3 - Alpha",

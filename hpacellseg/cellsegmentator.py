@@ -1,6 +1,7 @@
 """Package for loading and running the nuclei and cell segmentation models programmaticly."""
 import os
 import sys
+from collections import defaultdict
 
 import cv2
 import imageio
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn
 import torch.nn.functional as F
-from skimage import util
+from skimage import transform, util
 
 from hpacellseg.constants import (MULTI_CHANNEL_CELL_MODEL_URL,
                                   NUCLEI_MODEL_URL, TWO_CHANNEL_CELL_MODEL_URL)
@@ -24,10 +25,9 @@ class CellSegmentator(object):
             self,
             nuclei_model="./nuclei_model.pth",
             cell_model="./cell_model.pth",
-            model_width_height=512,
+            scale_factor=0.25,
             device="cuda",
             multi_channel_model=True,
-            return_without_scale_restore=False
     ):
         """Class for segmenting nuclei and whole cells from confocal microscopy images.
 
@@ -98,8 +98,7 @@ class CellSegmentator(object):
                     download_with_url(TWO_CHANNEL_CELL_MODEL_URL, cell_model)
             cell_model = torch.load(cell_model, map_location=torch.device(self.device))
         self.cell_model = cell_model.to(self.device)
-        self.model_width_height = model_width_height
-        self.return_without_scale_restore = return_without_scale_restore
+        self.scale_factor = scale_factor
 
     def _image_conversion(self, images):
         """Convert/Format images to RGB image arrays list for cell predictions.
@@ -193,15 +192,25 @@ class CellSegmentator(object):
                 raise NotImplementedError('Currently the model requires images as numpy arrays, not paths.')
                 # images = [imageio.imread(image_path) for image_path in images]
             self.target_shapes = [image.shape for image in images]
-            images = [cv2.resize(image, (self.model_width_height, self.model_width_height))
-                      if image.shape[0] != self.model_width_height or image.shape[
-                1] != self.model_width_height else image
+            images = [transform.rescale(image, self.scale_factor, multichannel=False)
                       for image in images]
 
-            nuc_images = np.array([np.dstack((image[..., 2], image[..., 2], image[..., 2])) if len(image.shape) >= 3
-                                   else np.dstack((image, image, image)) for image in images])
-            nuc_images = nuc_images.transpose([0, 3, 1, 2])
-            return nuc_images
+            self.scaled_shapes = [image.shape for image in images]
+            images = [cv2.copyMakeBorder(image, 32, (32 - image.shape[0] % 32), 32, (32 - image.shape[1] % 32),
+                                         cv2.BORDER_REFLECT) for image in images]
+
+            size_2_images = defaultdict(list)
+            img_idx_2_size_idx = []
+            for img_idx in range(len(images)):
+                image = images[img_idx]
+                img_size = image.shape[0]
+                img_idx_2_size_idx.append((img_size, len(size_2_images[img_size])))
+                size_2_images[img_size].append(
+                    np.dstack((image[..., 2], image[..., 2], image[..., 2])) if len(image.shape) >= 3
+                    else np.dstack((image, image, image)))
+            for img_size, images in size_2_images.items():
+                size_2_images[img_size] = np.array(images).transpose([0, 3, 1, 2])
+            return size_2_images, img_idx_2_size_idx
 
         def _segment_helper(imgs):
             with torch.no_grad():
@@ -215,27 +224,48 @@ class CellSegmentator(object):
                 imgs = F.softmax(imgs, dim=1)
                 return imgs
 
-        preprocessed_imgs = _preprocess(images)
-        predictions = _segment_helper(preprocessed_imgs)
-        predictions = predictions.to("cpu").numpy()
-        predictions = [self._restore_scaling(util.img_as_ubyte(pred), target_shape)
-                       for pred, target_shape in zip(predictions, self.target_shapes)]
-        return predictions
+        size_2_preprocessed_imgs, img_idx_2_size_idx = _preprocess(images)
 
-    def _restore_scaling(self, n_prediction, target_shape):
+        size_2_predictins = dict()
+        for img_size, preprocessed_imgs in size_2_preprocessed_imgs.items():
+            predictions = _segment_helper(preprocessed_imgs)
+            predictions = predictions.to("cpu").numpy()
+            size_2_predictins[img_size] = predictions
+        predictions_reordered = []
+        for img_size, idx_per_size in img_idx_2_size_idx:
+            predictions_reordered.append(size_2_predictins[img_size][idx_per_size])
+        predictions = [self._restore_scaling(util.img_as_ubyte(pred), self.scaled_shapes[i])
+                       for i, pred in enumerate(predictions_reordered)]
+        nuc_size_medians = []
+        nuc_counts = []
+
+        for prediction in predictions:
+            nuc_size_median, nuc_count = self.get_median_nucleus_size_and_nuc_count(prediction)
+            nuc_size_medians.append(nuc_size_median)
+            nuc_counts.append(nuc_count)
+
+        return predictions, self.target_shapes, nuc_size_medians, nuc_counts
+
+
+    def get_median_nucleus_size_and_nuc_count(self, prediction):
+        blue_channel = prediction[:, :, 2].copy()
+        blue_channel[prediction[..., 1] > 10] = 0
+        _, _, _nuc_stats, _ = cv2.connectedComponentsWithStats(
+            cv2.threshold(blue_channel, 0, 255, cv2.THRESH_BINARY)[1].astype('uint8'), 4)
+        return np.median(_nuc_stats[1:, 4]), len(_nuc_stats) - 1
+
+
+    def _restore_scaling(self, n_prediction, scaled_shape):
         """Restore an image from scaling and padding.
 
         This method is intended for internal use.
         It takes the output from the nuclei model as input.
         """
         n_prediction = n_prediction.transpose([1, 2, 0])
+        n_prediction = n_prediction[
+                       32: 32 + scaled_shape[0], 32: 32 + scaled_shape[1], ...
+                       ]
         n_prediction[..., 0] = 0
-        if not self.return_without_scale_restore:
-            n_prediction = cv2.resize(
-                n_prediction,
-                (target_shape[0], target_shape[1]),
-                interpolation=cv2.INTER_NEAREST,
-            )
         return n_prediction
 
     def pred_cells(self, images, precombined=False):
@@ -272,12 +302,22 @@ class CellSegmentator(object):
             for image in images:
                 if not len(image.shape) == 3:
                     raise ValueError("image should has 3 channels")
-            images = np.array([cv2.resize(image, (self.model_width_height, self.model_width_height))
-                               if image.shape[0] != self.model_width_height or image.shape[1] != self.model_width_height
-                               else image
-                               for image in images])
-            cell_images = images.transpose([0, 3, 1, 2])
-            return cell_images
+
+            images = [transform.rescale(image, self.scale_factor, multichannel=True)
+                      for image in images]
+            self.scaled_shapes = [image.shape for image in images]
+            images = [cv2.copyMakeBorder(image, 32, (32 - image.shape[0] % 32), 32, (32 - image.shape[1] % 32),
+                                         cv2.BORDER_REFLECT) for image in images]
+            size_2_images = defaultdict(list)
+            img_idx_2_size_idx = []
+            for img_idx in range(len(images)):
+                image = images[img_idx]
+                img_size = image.shape[0]
+                img_idx_2_size_idx.append((img_size, len(size_2_images[img_size])))
+                size_2_images[img_size].append(image)
+            for img_size, images in size_2_images.items():
+                size_2_images[img_size] = np.array(images).transpose([0, 3, 1, 2])
+            return size_2_images, img_idx_2_size_idx
 
         def _segment_helper(imgs):
             with torch.no_grad():
@@ -292,9 +332,15 @@ class CellSegmentator(object):
 
         if not precombined:
             images = self._image_conversion(images)
-        preprocessed_imgs = _preprocess(images)
-        predictions = _segment_helper(preprocessed_imgs)
-        predictions = predictions.to("cpu").numpy()
-        predictions = [self._restore_scaling(util.img_as_ubyte(pred), target_shape)
-                       for pred, target_shape in zip(predictions, self.target_shapes)]
-        return predictions
+        size_2_preprocessed_imgs, img_idx_2_size_idx = _preprocess(images)
+        size_2_predictins = dict()
+        for img_size, preprocessed_imgs in size_2_preprocessed_imgs.items():
+            predictions = _segment_helper(preprocessed_imgs)
+            predictions = predictions.to("cpu").numpy()
+            size_2_predictins[img_size] = predictions
+        predictions_reordered = []
+        for img_size, idx_per_size in img_idx_2_size_idx:
+            predictions_reordered.append(size_2_predictins[img_size][idx_per_size])
+        predictions = [self._restore_scaling(util.img_as_ubyte(pred), self.scaled_shapes[i])
+                       for i, pred in enumerate(predictions_reordered)]
+        return predictions, self.target_shapes
